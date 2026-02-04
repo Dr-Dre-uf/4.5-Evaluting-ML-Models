@@ -1,151 +1,134 @@
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score, ConfusionMatrixDisplay
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+import psutil
+import os
 
-# Set the title and favicon that appear in the Browser's tab bar.
+# --- 1. SETUP & CACHING ---
 st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+    page_title="Module 4: Diabetes Prediction Analysis",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
-
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
 
 @st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+def load_data():
+    """Loads the diabetes dataset."""
+    # Using the path structure indicated in your notebook
+    url = "https://raw.githubusercontent.com/plotly/datasets/master/diabetes.csv"
+    df = pd.read_csv(url)
+    return df
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+@st.cache_data
+def preprocess_data(df):
+    """Handles missing values as per notebook logic."""
+    df_clean = df.copy()
+    # Replace 0 with median for Insulin as done in the notebook
+    insulin_median = df_clean['Insulin'].median()
+    df_clean['Insulin'] = df_clean['Insulin'].replace(0, insulin_median)
+    return df_clean
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# --- 2. SIDEBAR NAVIGATION ---
+st.sidebar.title("App Navigation")
+pages = ["1. Data Overview", "2. Visual Exploratory Analysis", "3. Model Training & Metrics"]
+page = st.sidebar.radio("Go to:", pages)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+# System Monitor
+st.sidebar.markdown("---")
+st.sidebar.subheader("System Monitor")
+mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+st.sidebar.metric("RAM Usage", f"{mem:.1f} MB")
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+# Load Data
+df_raw = load_data()
+df_processed = preprocess_data(df_raw)
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+# --- 3. PAGE LOGIC ---
 
-    return gdp_df
+if page == "1. Data Overview":
+    st.title("Data Processing & Overview")
+    st.markdown("""
+    This module explores the Diabetes dataset. Following the notebook logic, we identified that 
+    the **Insulin** column contained zero values that likely represented missing data.
+    """)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Raw Data Preview")
+        st.dataframe(df_raw.head())
+    with col2:
+        st.subheader("Processed Data (Median Imputation)")
+        st.dataframe(df_processed.head())
 
-gdp_df = get_gdp_data()
+    st.write(f"**Dataset Shape:** {df_processed.shape}")
+    st.info("Imputation logic: Zero values in 'Insulin' were replaced with the column median.")
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+elif page == "2. Visual Exploratory Analysis":
+    st.title("Exploratory Analysis")
+    
+    viz_type = st.selectbox("Select Visualization", ["Age Distribution", "BMI Histogram", "Outcome Balance"])
+    
+    fig, ax = plt.subplots()
+    if viz_type == "Age Distribution":
+        df_processed['Age'].plot(kind='density', ax=ax, title="Age Density Plot")
+    elif viz_type == "BMI Histogram":
+        df_processed['BMI'].hist(ax=ax, bins=20)
+        ax.set_title("BMI Distribution")
+    elif viz_type == "Outcome Balance":
+        sns.countplot(x='Outcome', data=df_processed, ax=ax)
+        ax.set_title("Target Variable (Outcome) Distribution")
+    
+    st.pyplot(fig)
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+elif page == "3. Model Training & Metrics":
+    st.title("Model Training & Evaluation")
+    
+    model_choice = st.selectbox("Select Model to Train", ["Logistic Regression", "Support Vector Machine (SVM)"])
+    
+    # Split Data
+    X = df_processed.drop('Outcome', axis=1)
+    y = df_processed['Outcome']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
+    if st.button(f"Train {model_choice}"):
+        if model_choice == "Logistic Regression":
+            model = LogisticRegression(max_iter=1000)
         else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+            # SVM usually requires scaling for convergence
+            model = make_pipeline(StandardScaler(), SVC(probability=True))
+            
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)[:, 1]
+        
+        # Display Metrics
+        st.subheader("Performance Metrics")
+        col_m1, col_m2 = st.columns(2)
+        col_m1.metric("ROC AUC Score", f"{roc_auc_score(y_test, y_prob):.3f}")
+        
+        st.text("Classification Report:")
+        st.code(classification_report(y_test, y_pred))
+        
+        # Confusion Matrix
+        st.subheader("Confusion Matrix")
+        fig, ax = plt.subplots()
+        ConfusionMatrixDisplay.from_estimator(model, X_test, y_test, ax=ax, cmap='Blues')
+        st.pyplot(fig)
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+# --- 4. QUESTION MODULES (Demo Interaction) ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Quick Quiz")
+q1 = st.sidebar.radio("What was used to impute missing Insulin values?", ["Mean", "Median", "Zero"])
+if st.sidebar.button("Check Answer"):
+    if q1 == "Median":
+        st.sidebar.success("Correct!")
+    else:
+        st.sidebar.error("Incorrect. See Data Processing.")

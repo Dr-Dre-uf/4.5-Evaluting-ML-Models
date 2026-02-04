@@ -1,2 +1,9 @@
 streamlit
 pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+statsmodels
+psutil
+shap
