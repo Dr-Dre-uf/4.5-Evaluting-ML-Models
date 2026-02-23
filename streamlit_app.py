@@ -215,6 +215,6 @@ elif page == "Model Training":
 
                 # Confusion Matrix Plot
                 st.subheader("Confusion Matrix")
-                                fig, ax = plt.subplots()
+                fig, ax = plt.subplots()
                 ConfusionMatrixDisplay.from_estimator(model, X_test, y_test, ax=ax, cmap="Blues")
                 st.pyplot(fig)
