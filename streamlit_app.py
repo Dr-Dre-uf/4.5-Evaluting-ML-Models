@@ -161,7 +161,7 @@ elif page == "Model Training":
         st.markdown("""
         ### Instructions
         1. **Select Vitals**: Choose which patient vitals the diagnostic tool should use.
-        2. **Choose Algorithm**: Logistic Regression is often preferred in clinical settings for its interpretability (odds ratios). SVM is used for complex, non-linear patient risk profiles.
+        2. **Algorithm & Parameters**: Select an algorithm and adjust its strictness. In a clinical context, adjusting regularization (C) changes how heavily the model penalizes complex risk factors, which can impact false positive rates.
         3. **Clinical Evaluation**: The ROC AUC score measures the tool's ability to correctly diagnose patients. The confusion matrix shows false positives vs. false negatives.
         """)
     else:
@@ -169,8 +169,8 @@ elif page == "Model Training":
         st.markdown("""
         ### Instructions
         1. **Select Features**: Choose the independent variables for the predictive model.
-        2. **Choose Algorithm**: Logistic Regression maps linear probabilities. SVM finds an optimal hyperplane in a higher-dimensional space and requires feature scaling (StandardScaler) to converge efficiently.
-        3. **Model Evaluation**: The ROC AUC score is the primary metric for binary classification performance. The confusion matrix visualizes Type I and Type II errors.
+        2. **Hyperparameter Tuning**: Select an algorithm and tune its parameters. For Logistic Regression, 'C' controls regularization strength. For SVM, you can also alter the kernel type to project the data into different dimensions to find the optimal hyperplane.
+        3. **Model Evaluation**: The ROC AUC score is the primary metric for binary classification. The confusion matrix visualizes Type I and Type II errors.
         """)
 
     all_features = df.columns[:-1].tolist()
@@ -180,10 +180,27 @@ elif page == "Model Training":
         default=['Glucose', 'BMI', 'Age', 'Insulin']
     )
 
-    model_type = st.selectbox(
-        "Choose Algorithm:",
-        ["Logistic Regression", "Support Vector Machine (SVM)"]
-    )
+    st.markdown("---")
+    
+    col_algo, col_params = st.columns(2)
+    
+    with col_algo:
+        model_type = st.selectbox(
+            "Choose Algorithm:",
+            ["Logistic Regression", "Support Vector Machine (SVM)"]
+        )
+
+    # Dynamic Interactive Parameters
+    with col_params:
+        if model_type == "Logistic Regression":
+            c_param = st.slider("Regularization Strength (C):", min_value=0.01, max_value=10.0, value=1.0, step=0.1, help="Smaller values specify stronger regularization.")
+            max_iter_param = st.slider("Maximum Iterations:", min_value=100, max_value=2000, value=1000, step=100)
+        else:
+            c_param_svm = st.slider("Regularization Strength (C):", min_value=0.1, max_value=10.0, value=1.0, step=0.1, help="Controls the penalty for misclassifying training examples.")
+            kernel_param = st.selectbox("Kernel Type:", ["linear", "poly", "rbf", "sigmoid"], index=2, help="Transforms data into higher dimensions. RBF is the default non-linear kernel.")
+            gamma_param = st.selectbox("Gamma:", ["scale", "auto"], index=1, help="Kernel coefficient. 'Auto' matches the notebook logic.")
+
+    st.markdown("---")
 
     if st.button("Train and Evaluate Model"):
         if not selected_features:
@@ -195,10 +212,11 @@ elif page == "Model Training":
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
             with st.spinner("Processing..."):
+                # Apply the interactive parameters to the models
                 if model_type == "Logistic Regression":
-                    model = LogisticRegression(max_iter=1000)
+                    model = LogisticRegression(C=c_param, max_iter=max_iter_param)
                 else:
-                    model = make_pipeline(StandardScaler(), SVC(probability=True, gamma='auto'))
+                    model = make_pipeline(StandardScaler(), SVC(C=c_param_svm, kernel=kernel_param, gamma=gamma_param, probability=True))
 
                 model.fit(X_train, y_train)
                 y_pred = model.predict(X_test)
