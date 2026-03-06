@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, roc_auc_score, ConfusionMatrixDisplay
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
+import shap
 import psutil
 import os
 
@@ -18,6 +19,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Ensure pyplot does not throw global warnings with SHAP
+st.set_option('deprecation.showPyplotGlobalUse', False)
 
 @st.cache_data
 def load_and_clean_data():
@@ -211,7 +215,7 @@ elif page == "Model Training":
             
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-            with st.spinner("Processing..."):
+            with st.spinner("Processing Model and Interpretability Data..."):
                 # Apply the interactive parameters to the models
                 if model_type == "Logistic Regression":
                     model = LogisticRegression(C=c_param, max_iter=max_iter_param)
@@ -236,3 +240,25 @@ elif page == "Model Training":
                 fig, ax = plt.subplots()
                 ConfusionMatrixDisplay.from_estimator(model, X_test, y_test, ax=ax, cmap="Blues")
                 st.pyplot(fig)
+
+                # --- SHAP Interpretability ---
+                st.markdown("---")
+                st.subheader("Feature Interpretability (SHAP)")
+                
+                if track == "Clinical Science":
+                    st.markdown("This chart explains how each clinical marker influenced the diagnostic model. Features at the top have the strongest impact on predicting diabetes.")
+                else:
+                    st.markdown("This summary plot breaks down the global feature importance and directional impact of each variable using Shapley values.")
+
+                try:
+                    if model_type == "Logistic Regression":
+                        explainer = shap.LinearExplainer(model, X_train)
+                        shap_values = explainer.shap_values(X_test)
+                        
+                        fig_shap = plt.figure()
+                        shap.summary_plot(shap_values, X_test, show=False)
+                        st.pyplot(fig_shap)
+                    else:
+                        st.warning("SHAP summary plots are computationally heavy for non-linear SVM pipelines in a live application. Please select Logistic Regression to view real-time feature importance.")
+                except Exception as e:
+                    st.error("Could not generate SHAP values for the current configuration.")
