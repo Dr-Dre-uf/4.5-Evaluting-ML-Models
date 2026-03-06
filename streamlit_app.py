@@ -20,9 +20,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Ensure pyplot does not throw global warnings with SHAP
-st.set_option('deprecation.showPyplotGlobalUse', False)
-
 @st.cache_data
 def load_and_clean_data():
     """Loads data and implements the notebook's imputation logic."""
@@ -261,4 +258,4 @@ elif page == "Model Training":
                     else:
                         st.warning("SHAP summary plots are computationally heavy for non-linear SVM pipelines in a live application. Please select Logistic Regression to view real-time feature importance.")
                 except Exception as e:
-                    st.error("Could not generate SHAP values for the current configuration.")
+                    st.error(f"Could not generate SHAP values: {e}")
