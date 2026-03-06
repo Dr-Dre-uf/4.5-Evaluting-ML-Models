@@ -2,260 +2,516 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
+import statsmodels.formula.api as smf
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, roc_auc_score, ConfusionMatrixDisplay
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
-import shap
+from sklearn.metrics import roc_auc_score
 import psutil
 import os
 
 # --- 1. SETUP & CACHING ---
 st.set_page_config(
-    page_title="AI Passport Module 4: Diabetes Analysis",
+    page_title="Evaluating Machine Learning Models",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 @st.cache_data
-def load_and_clean_data():
-    """Loads data and implements the notebook's imputation logic."""
-    url = "https://raw.githubusercontent.com/plotly/datasets/master/diabetes.csv"
-    df = pd.read_csv(url)
+def build_eicu_data():
+    """Loads and merges the raw eICU data."""
+    # Load patient information
+    patient_cols = ['patientunitstayid', 'hospitalid', 'gender', 'age', 'ethnicity', 'admissionheight', 'admissionweight', 'dischargeweight',
+                'hospitaladmitsource', 'hospitaldischargelocation', 'hospitaldischargestatus', 'unittype', 'uniquepid', 'unitvisitnumber',
+                'patienthealthsystemstayid', 'hospitaldischargeyear']
+    df = pd.read_csv('https://www.dropbox.com/scl/fi/qld4pvo6vlptm41av3y2e/patient.csv?rlkey=gry21fvb3u3dytz7i5jcujcu9&dl=1',
+                      usecols=patient_cols)
     
-    # Notebook Logic: Replace 0s with median for continuous markers
-    cols_to_fix = ['Insulin', 'BMI', 'Glucose', 'BloodPressure', 'SkinThickness']
-    for col in cols_to_fix:
-        median_val = df[col].median()
-        df[col] = df[col].replace(0, median_val)
+    # Clean Age for numerical filtering
+    df['age'] = df['age'].replace({'> 89': 90})
+    df['age'] = pd.to_numeric(df['age'], errors='coerce') 
+    
+    df = df.sort_values(by=['uniquepid', 'patienthealthsystemstayid', 'unitvisitnumber'])
+    df = df.groupby('patienthealthsystemstayid').first().reset_index()
+    df = df.drop(columns=['unitvisitnumber'])
+
+    # Load hospital information
+    hospital = pd.read_csv('https://www.dropbox.com/scl/fi/5sdjsbrjxk0hlbmpb4csi/hospital.csv?rlkey=rmlrhg3m9sm3hj2s6rykrg5w2&st=329j4gwk&dl=1')
+    with pd.option_context('future.no_silent_downcasting', True):
+        hospital = hospital.replace({'teachingstatus': {'f': 0, 't':1}})
+
+    df = df.merge(hospital, on='hospitalid', how='left')
+
+    # Load labs
+    labcols = ['patientunitstayid', 'labname', 'labresult']
+    
+    # Updated alphabetized list to match pivot_table output
+    labnames = ['BUN', 'Hct', 'Hgb', 'MCH', 'MCHC', 'MCV', 'RBC', 'RDW', 'albumin', 'bicarbonate', 'calcium', 'chloride', 'creatinine', 'glucose', 'platelets', 'potassium', 'sodium', 'wbc']
+    
+    labs = pd.read_csv('https://www.dropbox.com/scl/fi/qaxtx330hicc5u61siehn/lab.csv?rlkey=xs9oxpl5istkbuh5s80oyxwwi&st=ydfrjxkh&dl=1',
+                        usecols=labcols)
+    labs['labname'] = labs['labname'].replace({
+        'WBC x 1000': 'wbc',
+        'platelets x 1000': 'platelets'
+    })
+    labs = labs[labcols]
+    labs = labs[labs['labname'].isin(labnames)]
+    labs = labs.pivot_table(columns=['labname'], values=['labresult'], aggfunc='mean', index='patientunitstayid')
+    labs.columns = list(labs.columns.droplevel(0))
+    labs = labs.reset_index()
+    
+    # Apply the 'lab_' prefix
+    labnames = ['lab_' + c.lower() for c in labnames]
+    labs.columns = ['patientunitstayid'] + labnames
+
+    df = df.merge(labs, on='patientunitstayid', how='left')
+
+    # Renaming
+    df = df.rename(columns={
+        'uniquepid': 'patient_id',
+        'patienthealthsystemstayid': 'admission_id',
+        'hospitaldischargeyear': 'admission_year',
+        'hospitalid': 'hospital_id',
+        'admissionheight': 'height',
+        'admissionweight': 'weight_admission',
+        'dischargeweight': 'weight_discharge',
+        'region': 'hospital_region',
+        'teachingstatus': 'hospital_teaching',
+        'numbedscategory': 'hospital_beds',
+        'hospitaladmitsource': 'admission_source',
+        'hospitaldischargelocation': 'discharge_location'
+    })
+
+    df['in_hospital_mortality'] = df['hospitaldischargestatus'].map(lambda status: {'Alive': 0, 'Expired': 1}[status]
+                                                                    if pd.notnull(status) else status)
+    df = df.drop(columns=['hospitaldischargestatus'])
+
+    df_cols = ['patient_id', 'admission_id', 'admission_year', 'age', 'gender', 'ethnicity', 'height', 'weight_admission',
+               'weight_discharge', 'admission_source', 'hospital_id', 'hospital_region', 'hospital_teaching',
+               'hospital_beds'] + labnames + ['discharge_location', 'in_hospital_mortality']
+    df = df[df_cols]
+    df = df.sort_values(by=['admission_year', 'patient_id', 'admission_id'])
+    df = df.reset_index(drop=True)
     return df
 
+@st.cache_data
+def get_processed_data(df_raw):
+    """Runs the preprocessing steps (One-Hot Encoding & Imputation)."""
+    # Drop IDs for processing
+    x = df_raw.drop(columns=['patient_id', 'hospital_id', 'admission_id', 'admission_year', 'weight_discharge', 'discharge_location'])
+    
+    numerical_features = ['age', 'height','weight_admission', 'hospital_teaching', 
+                          'lab_bun', 'lab_hct', 'lab_hgb', 'lab_mch', 'lab_mchc', 
+                          'lab_mcv', 'lab_rbc', 'lab_rdw', 'lab_albumin', 'lab_bicarbonate', 
+                          'lab_calcium', 'lab_chloride', 'lab_creatinine', 'lab_glucose', 
+                          'lab_platelets', 'lab_potassium', 'lab_sodium', 'lab_wbc']
+
+    categorical_features = ['ethnicity', 'admission_source', 'hospital_region', 'hospital_beds']
+    
+    x[numerical_features] = x[numerical_features].apply(pd.to_numeric, errors='coerce', axis=1)
+    x[numerical_features] = x[numerical_features].fillna(x[numerical_features].mean())
+    
+    # Standard preprocessing
+    x = pd.get_dummies(x, columns=categorical_features, dtype='int')
+    x['in_hospital_mortality'] = x['in_hospital_mortality'].fillna(0)
+    
+    return x
+
 # --- 2. SIDEBAR NAVIGATION ---
-st.sidebar.title("AI Passport Analysis")
+st.sidebar.title("Evaluating Machine Learning Models")
 
-# Dual-Track Selection Toggle
-track = st.sidebar.radio(
-    "Select Science Track:", 
-    ["Clinical Science", "Foundational Science"],
-    help="Toggle between a clinical healthcare focus or a foundational data science focus."
-)
+# Define pages
+pages = ["1. Data Processing", "2. Exploratory Analysis", "3. Univariate Analysis", "4. Multivariate Analysis"]
 
-st.sidebar.markdown("---")
-
-pages = [
-    "Data Explorer",
-    "Visual Analytics",
-    "Model Training"
-]
-
+# Main Menu with Tooltip
 page = st.sidebar.radio(
-    "Select Stage:", 
+    "Go to:", 
     pages,
-    help="Navigate through the workflow from data inspection to model evaluation."
+    help="Navigate through the 4 steps of the analysis pipeline. Hover over the info box below for more details on your current selection."
 )
 
-# --- SYSTEM MONITOR (CPU + RAM) ---
+# Dynamic Info Box (Acts as a tooltip description for the active page)
+if page == "1. Data Processing":
+    st.sidebar.info("Clean the raw dataset, remove identifiers, and handle missing values.")
+elif page == "2. Exploratory Analysis":
+    st.sidebar.info("Visualize patient demographics and answer key conceptual questions.")
+elif page == "3. Univariate Analysis":
+    st.sidebar.info("Calculate Odds Ratios for individual variables to see sex-specific risk factors.")
+elif page == "4. Multivariate Analysis":
+    st.sidebar.info("Train and evaluate complex models. Compare AUROC performance between sexes.")
+
+# --- SYSTEM MONITOR (Bottom of Sidebar) ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("System Monitor")
 pid = os.getpid()
 py = psutil.Process(pid)
-memory_use = py.memory_info().rss / 1024 / 1024
-cpu_use = psutil.cpu_percent(interval=1)
+memory_use = py.memory_info().rss / 1024 / 1024  # Memory in MB
+cpu_use = psutil.cpu_percent(interval=None)     # CPU Percent (non-blocking)
 
 col1, col2 = st.sidebar.columns(2)
-col1.metric("CPU Usage", f"{cpu_use}%")
-col2.metric("RAM Usage", f"{memory_use:.0f} MB")
-st.sidebar.caption("Real-time resource usage of this instance.")
-
-# Initialize Data
-df = load_and_clean_data()
+col1.metric("CPU", f"{cpu_use}%")
+col2.metric("RAM", f"{memory_use:.0f} MB")
+st.sidebar.caption("Real-time resource usage of this app instance.")
 
 # --- 3. PAGE LOGIC ---
 
-# === PAGE: DATA EXPLORER ===
-if page == "Data Explorer":
-    if track == "Clinical Science":
-        st.title("Patient Demographics & Vitals Explorer")
-        st.markdown("""
-        ### Instructions
-        Use this page to review the patient cohort from the Pima Indians Diabetes dataset.
-        1. **Clinical Data Handling**: In real-world clinical settings, missing lab results are common. Here, missing values (recorded as 0) for vitals like Insulin and BMI have been imputed with the cohort median to preserve patient records.
-        2. **Patient Filtering**: Use the sliders below to subset the patient population by Age and BMI.
-        """)
-    else:
-        st.title("Dataset & Feature Explorer")
-        st.markdown("""
-        ### Instructions
-        Use this page to inspect the raw features of the diabetes dataset.
-        1. **Data Imputation**: From a foundational data science perspective, 0 values in continuous biological variables represent missing data. The pipeline automatically imputes these with the feature median to prevent skewed model weights.
-        2. **Feature Filtering**: Use the sliders below to subset the dataset based on variable ranges.
-        """)
-
-    with st.expander("Filter Options", expanded=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            age_range = st.slider("Select Age Range", 21, 81, (21, 81), help="Filter the table based on age.")
-        with c2:
-            bmi_range = st.slider("Select BMI Range", 18.0, 67.0, (18.0, 67.0), help="Filter the table based on BMI.")
-
-    filtered_df = df[
-        (df['Age'].between(age_range[0], age_range[1])) & 
-        (df['BMI'].between(bmi_range[0], bmi_range[1]))
-    ]
-
-    st.subheader("Data Preview")
-    st.dataframe(filtered_df, use_container_width=True)
+# === 1. DATA PROCESSING ===
+if page == "1. Data Processing":
+    st.title("Data Processing")
     
-    if track == "Clinical Science":
-        st.caption(f"Showing {len(filtered_df)} patient records based on current filters.")
-    else:
-        st.caption(f"Showing {len(filtered_df)} samples based on current feature filters.")
-
-# === PAGE: VISUAL ANALYTICS ===
-elif page == "Visual Analytics":
-    if track == "Clinical Science":
-        st.title("Clinical Marker Analysis")
-        st.markdown("""
-        ### Instructions
-        Visualizing clinical markers helps clinicians identify risk factors.
-        1. **Marker Selection**: Choose a clinical vital from the dropdown.
-        2. **Diagnostic Comparison**: The charts compare the distribution of the marker between healthy patients (0) and diabetic patients (1).
-        """)
-    else:
-        st.title("Biomarker Distribution Analysis")
-        st.markdown("""
-        ### Instructions
-        Visualizing data distributions is critical for understanding feature variance before training.
-        1. **Feature Selection**: Choose a biomarker to visualize.
-        2. **Class Separation**: Observe how well the feature separates the binary target classes (0 vs 1). Boxplots are especially useful for identifying outliers.
-        """)
+    st.markdown("""
+    ### Removing Irrelevant Columns
+    One of the first logical steps is to remove the columns that contain no informational value. Some columns are unique random numeric identifiers (e.g., patient_id) with no discernible meaning. 
     
-    col_feat, col_type = st.columns(2)
-    with col_feat:
-        feature = st.selectbox("Select Variable to Analyze", df.columns[:-1])
-    with col_type:
-        plot_type = st.radio("Plot Type", ["Distribution", "Boxplot"], horizontal=True)
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    if plot_type == "Distribution":
-        sns.histplot(data=df, x=feature, hue="Outcome", kde=True, ax=ax, palette="viridis")
-        if track == "Clinical Science":
-            ax.set_title(f"Patient Distribution of {feature} by Diagnosis")
-        else:
-            ax.set_title(f"Statistical Distribution of {feature} by Target Class")
-    else:
-        sns.boxplot(data=df, x="Outcome", y=feature, ax=ax, palette="magma")
-        if track == "Clinical Science":
-            ax.set_title(f"{feature} Spread between Healthy (0) and Diabetic (1) Patients")
-        else:
-            ax.set_title(f"Feature Variance and Outliers for {feature}")
+    We'll also remove weight_discharge and discharge_location because they will not be used as inputs.
     
-    st.pyplot(fig)
+    ### Fast Preprocessing
+    We will save time with a heavy-handed approach:
+    1. One-hot encode all categorical variables.
+    2. Impute missing values in each numerical column with the mean.
+    """)
 
-# === PAGE: MODEL TRAINING ===
-elif page == "Model Training":
-    if track == "Clinical Science":
-        st.title("Diagnostic Predictive Engine")
-        st.markdown("""
-        ### Instructions
-        1. **Select Vitals**: Choose which patient vitals the diagnostic tool should use.
-        2. **Algorithm & Parameters**: Select an algorithm and adjust its strictness. In a clinical context, adjusting regularization (C) changes how heavily the model penalizes complex risk factors, which can impact false positive rates.
-        3. **Clinical Evaluation**: The ROC AUC score measures the tool's ability to correctly diagnose patients. The confusion matrix shows false positives vs. false negatives.
-        """)
-    else:
-        st.title("Machine Learning Pipeline")
-        st.markdown("""
-        ### Instructions
-        1. **Select Features**: Choose the independent variables for the predictive model.
-        2. **Hyperparameter Tuning**: Select an algorithm and tune its parameters. For Logistic Regression, 'C' controls regularization strength. For SVM, you can also alter the kernel type to project the data into different dimensions to find the optimal hyperplane.
-        3. **Model Evaluation**: The ROC AUC score is the primary metric for binary classification. The confusion matrix visualizes Type I and Type II errors.
-        """)
+    # Initialize state
+    if 'proc_run' not in st.session_state:
+        st.session_state.proc_run = False
+        
+    with st.spinner("Loading Raw Data..."):
+        df_raw = build_eicu_data()
 
-    all_features = df.columns[:-1].tolist()
-    selected_features = st.multiselect(
-        "Select Predictors/Features:",
-        all_features,
-        default=['Glucose', 'BMI', 'Age', 'Insulin']
-    )
+    if st.button("Run Preprocessing Pipeline", help="Clean the data, impute missing values, and prepare it for modeling."):
+        st.session_state.proc_run = True
 
-    st.markdown("---")
-    
-    col_algo, col_params = st.columns(2)
-    
-    with col_algo:
-        model_type = st.selectbox(
-            "Choose Algorithm:",
-            ["Logistic Regression", "Support Vector Machine (SVM)"]
+    if st.session_state.proc_run:
+        with st.spinner("Processing..."):
+            df_processed = get_processed_data(df_raw)
+            
+        st.success("Preprocessing Complete")
+        st.write(f"Processed Data Shape: {df_processed.shape}")
+        
+        st.subheader("Processed Data Preview")
+        st.dataframe(df_processed.head(), use_container_width=True)
+        st.caption("A preview of the first 5 rows of the clean dataset.")
+        
+        csv = df_processed.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "Download Processed CSV", 
+            csv, 
+            "eicu_processed.csv", 
+            "text/csv", 
+            key='download-csv-processed',
+            help="Download the cleaned dataset to your computer as a CSV file."
         )
 
-    # Dynamic Interactive Parameters
-    with col_params:
-        if model_type == "Logistic Regression":
-            c_param = st.slider("Regularization Strength (C):", min_value=0.01, max_value=10.0, value=1.0, step=0.1, help="Smaller values specify stronger regularization.")
-            max_iter_param = st.slider("Maximum Iterations:", min_value=100, max_value=2000, value=1000, step=100)
-        else:
-            c_param_svm = st.slider("Regularization Strength (C):", min_value=0.1, max_value=10.0, value=1.0, step=0.1, help="Controls the penalty for misclassifying training examples.")
-            kernel_param = st.selectbox("Kernel Type:", ["linear", "poly", "rbf", "sigmoid"], index=2, help="Transforms data into higher dimensions. RBF is the default non-linear kernel.")
-            gamma_param = st.selectbox("Gamma:", ["scale", "auto"], index=1, help="Kernel coefficient. 'Auto' matches the notebook logic.")
+# === 2. EXPLORATORY ANALYSIS ===
+elif page == "2. Exploratory Analysis":
+    st.title("Exploratory Analysis")
 
-    st.markdown("---")
+    st.subheader("Brief Exploratory Analysis")
+    st.markdown("""
+    Now, please take a moment to check the Data Explorer. Notice that, this isn't about deep analysis, just getting a feel for the data at a glance. Keep it simple, you're just getting familiar with the variable before modeling.
+    """)
+    
+    with st.spinner("Loading Data Explorer..."):
+        df_raw = build_eicu_data()
+        df_explorer = df_raw.drop(columns=['patient_id', 'hospital_id', 'admission_id', 'admission_year', 'weight_discharge', 'discharge_location'])
+        
+        df_processed = get_processed_data(df_raw)
+        if 'gender' not in df_processed.columns:
+            df_processed['gender'] = df_raw['gender']
 
-    if st.button("Train and Evaluate Model"):
-        if not selected_features:
-            st.error("Please select at least one variable.")
-        else:
-            X = df[selected_features]
-            y = df['Outcome']
+    # --- DATA EXPLORER FILTERS ---
+    with st.expander("Filter Data Explorer Options", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            all_regions = df_explorer['hospital_region'].dropna().unique().tolist()
+            selected_regions = st.multiselect("Hospital Region:", all_regions, default=all_regions, help="Filter by geographical region.")
+        with c2:
+            all_genders = df_explorer['gender'].dropna().unique().tolist()
+            selected_genders = st.multiselect("Gender:", all_genders, default=all_genders, help="Filter by gender.")
             
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        st.write("---")
+        c3, c4, c5 = st.columns(3)
+        with c3:
+            min_age, max_age = int(df_explorer['age'].min()), int(df_explorer['age'].max())
+            age_range = st.slider("Patient Age:", min_age, max_age, (min_age, max_age), help="Filter by age range.")
+        with c4:
+            min_h = float(df_explorer['height'].dropna().min())
+            max_h = float(df_explorer['height'].dropna().max())
+            height_range = st.slider("Height (cm):", min_h, max_h, (min_h, max_h), help="Filter by height.")
+        with c5:
+            min_w = float(df_explorer['weight_admission'].dropna().min())
+            max_w = float(df_explorer['weight_admission'].dropna().max())
+            weight_range = st.slider("Weight (kg):", min_w, max_w, (min_w, max_w), help="Filter by weight.")
 
-            with st.spinner("Processing Model and Interpretability Data..."):
-                # Apply the interactive parameters to the models
-                if model_type == "Logistic Regression":
-                    model = LogisticRegression(C=c_param, max_iter=max_iter_param)
-                else:
-                    model = make_pipeline(StandardScaler(), SVC(C=c_param_svm, kernel=kernel_param, gamma=gamma_param, probability=True))
+    # Apply Filters
+    mask = (
+        (df_explorer['hospital_region'].isin(selected_regions)) &
+        (df_explorer['gender'].isin(selected_genders)) &
+        (df_explorer['age'].between(age_range[0], age_range[1])) &
+        (df_explorer['height'].between(height_range[0], height_range[1])) &
+        (df_explorer['weight_admission'].between(weight_range[0], weight_range[1]))
+    )
+    df_filtered = df_explorer[mask]
 
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_test)
-                y_prob = model.predict_proba(X_test)[:, 1]
+    st.dataframe(df_filtered, height=300, use_container_width=True)
+    st.caption(f"Showing {len(df_filtered)} of {len(df_explorer)} patients.")
+    st.divider()
 
-                # --- Results Display ---
-                st.info(f"{model_type} training and evaluation complete.")
-                
-                m1, m2 = st.columns(2)
-                m1.metric("ROC AUC Score", f"{roc_auc_score(y_test, y_prob):.3f}")
-                
-                with st.expander("View Full Classification Report"):
-                    st.code(classification_report(y_test, y_pred))
+    # --- VISUALIZATION ---
+    st.subheader("Visualize the sex-specific patterns")
+    st.markdown("""
+    Before jumping into modeling, it is important to ask: "Do males and females behave differently in this data?" In many clinical datasets, combining all patients into a single analysis can blur important differences. Let's split the lens and take a closer look.
+    """)
 
-                # Confusion Matrix Plot
-                st.subheader("Confusion Matrix")
-                fig, ax = plt.subplots()
-                ConfusionMatrixDisplay.from_estimator(model, X_test, y_test, ax=ax, cmap="Blues")
-                st.pyplot(fig)
+    st.subheader("Interactive Statistics")
+    available_vars = ['age', 'height','weight_admission', 'lab_bun', 'lab_hct', 'lab_hgb', 'lab_mch', 'lab_mchc', 
+                      'lab_mcv', 'lab_rbc', 'lab_rdw', 'lab_albumin', 'lab_bicarbonate', 
+                      'lab_calcium', 'lab_chloride', 'lab_creatinine', 'lab_glucose', 
+                      'lab_platelets', 'lab_potassium', 'lab_sodium', 'lab_wbc']
+    
+    selected_variables = st.multiselect(
+        "Select Variables to Compare:", 
+        available_vars, 
+        default=['lab_bun','lab_creatinine','lab_sodium'],
+        help="Select variables to compare mean values between men and women, split by survival."
+    )
 
-                # --- SHAP Interpretability ---
-                st.markdown("---")
-                st.subheader("Feature Interpretability (SHAP)")
-                
-                if track == "Clinical Science":
-                    st.markdown("This chart explains how each clinical marker influenced the diagnostic model. Features at the top have the strongest impact on predicting diabetes.")
-                else:
-                    st.markdown("This summary plot breaks down the global feature importance and directional impact of each variable using Shapley values.")
+    if selected_variables:
+        df_male = df_processed[df_processed['gender'] == "Male"]
+        df_female = df_processed[df_processed['gender'] == "Female"]
 
-                try:
-                    if model_type == "Logistic Regression":
-                        explainer = shap.LinearExplainer(model, X_train)
-                        shap_values = explainer.shap_values(X_test)
-                        
-                        fig_shap = plt.figure()
-                        shap.summary_plot(shap_values, X_test, show=False)
-                        st.pyplot(fig_shap)
-                    else:
-                        st.warning("SHAP summary plots are computationally heavy for non-linear SVM pipelines in a live application. Please select Logistic Regression to view real-time feature importance.")
-                except Exception as e:
-                    st.error(f"Could not generate SHAP values: {e}")
+        female_survived = [df_female.loc[df_female['in_hospital_mortality'] == 0][str(i)].mean() for i in selected_variables]
+        female_dead = [df_female.loc[df_female['in_hospital_mortality'] == 1][str(i)].mean() for i in selected_variables]
+        male_survived = [df_male.loc[df_male['in_hospital_mortality'] == 0][str(i)].mean() for i in selected_variables]
+        male_dead = [df_male.loc[df_male['in_hospital_mortality'] == 1][str(i)].mean() for i in selected_variables]
+
+        Year = ['Survival'] * len(female_survived) + ['In hospital mortality'] * len(female_dead)
+        Female = female_survived + female_dead
+        Male = male_survived + male_dead
+        
+        df_plot = pd.DataFrame({'index': selected_variables * 2, 'Year': Year, 'Female': Female, 'Male': Male})
+        df_plot.set_index(['Year', 'index'], inplace=True)
+        df0 = df_plot.reorder_levels(['index', 'Year']).sort_index().unstack(level=-1)
+
+        colors = plt.cm.Paired.colors
+        fig, ax = plt.subplots(figsize=(10, 6))
+        (df0['Female'] + df0['Male']).plot(kind='barh', color=[colors[3], colors[2]], rot=0, ax=ax)
+        df0['Male'].plot(kind='barh', color=[colors[5], colors[4]], rot=0, ax=ax)
+        ax.legend([f'{val} ({context})' for val, context in df0.columns])
+        ax.set_title("Mean Values by Mortality Status (Stacked by Sex)")
+        st.pyplot(fig)
+        
+        # Accessibility: Data Table
+        with st.expander("View Chart Data as Table"):
+            st.dataframe(df0, use_container_width=True)
+
+    # --- QUESTION 1 ---
+    st.divider()
+    st.subheader("Question 1")
+    st.markdown("Why is it important to analyze clinical data separately for males and females before modeling?")
+    
+    q1_options = {
+        "A": "To reduce the number of observations",
+        "B": "To make the dataset more complex",
+        "C": "To identify sex-specific patterns that might be masked in pooled data",
+        "D": "To apply the same model to both groups without changes"
+    }
+    
+    q1_choice = st.radio("Select Answer:", list(q1_options.keys()), format_func=lambda x: f"{x}) {q1_options[x]}", key="q1")
+    
+    if st.button("Submit Question 1"):
+        if q1_choice == "C":
+            st.success("Correct! Clinical data often contains meaningful differences between males and females. When we analyze the entire dataset as a single group, these differences can get averaged out or hidden.")
+        else:
+            st.error("Try again.")
+
+# === 3. UNIVARIATE ANALYSIS ===
+elif page == "3. Univariate Analysis":
+    st.title("Sex-specific Association Models")
+    st.markdown("""
+    We will now perform a univariate analysis using odds ratios separately for females and males. 
+    
+    By calculating odds ratios within each sex, we can uncover whether a variable (like elevated lactate) has differential predictive power for mortality in women versus men.
+    """)
+
+    with st.spinner("Preparing Data & Models..."):
+        df_raw = build_eicu_data()
+        df_processed = get_processed_data(df_raw)
+        if 'gender' not in df_processed.columns:
+            df_processed['gender'] = df_raw['gender']
+
+        df_male = df_processed[df_processed['gender'] == "Male"]
+        df_female = df_processed[df_processed['gender'] == "Female"]
+
+        train_dat_female, test_dat_female = train_test_split(df_female, test_size=0.2, random_state=2025)
+        train_dat_male, test_dat_male = train_test_split(df_male, test_size=0.2, random_state=2025)
+        train_dat_full, test_dat_full = train_test_split(df_processed, test_size=0.2, random_state=2025)
+
+    all_vars = ['age', 'height','weight_admission', 'lab_bun', 'lab_hct', 'lab_hgb', 'lab_mch', 'lab_mchc', 
+                      'lab_mcv', 'lab_rbc', 'lab_rdw', 'lab_albumin', 'lab_bicarbonate', 
+                      'lab_calcium', 'lab_chloride', 'lab_creatinine', 'lab_glucose', 
+                      'lab_platelets', 'lab_potassium', 'lab_sodium', 'lab_wbc']
+    
+    st.subheader("Calculate Odds Ratios")
+    selected_variables = st.multiselect("Select Variables:", all_vars, default=all_vars[:10], help="Select predictors to analyze.")
+
+    if st.button("Run Regression Models", help="Fit logistic regression models for the selected variables."):
+        vals_male, vals_female, vals_full = [], [], []
+        
+        progress_bar = st.progress(0)
+        for i, univ_analysis in enumerate(selected_variables):
+            progress_bar.progress((i + 1) / len(selected_variables))
+            
+            # Male
+            reg_male = smf.logit(f'in_hospital_mortality ~ {univ_analysis}', data=train_dat_male).fit(disp=0)
+            vals_male.append(np.exp(reg_male.params).iloc[1]) # Get OR for the variable
+            
+            # Female
+            reg_female = smf.logit(f'in_hospital_mortality ~ {univ_analysis}', data=train_dat_female).fit(disp=0)
+            vals_female.append(np.exp(reg_female.params).iloc[1])
+            
+            # Full
+            reg_full = smf.logit(f'in_hospital_mortality ~ {univ_analysis}', data=train_dat_full).fit(disp=0)
+            vals_full.append(np.exp(reg_full.params).iloc[1])
+
+        progress_bar.empty()
+
+        fig, ax = plt.subplots(figsize=(12, len(selected_variables) * 0.6 + 2))
+        bar_width = 0.25
+        r1 = np.arange(len(selected_variables))
+        r2 = [x + bar_width for x in r1]
+        r3 = [x + bar_width for x in r2]
+        
+        ax.barh(r1, vals_female, bar_width, label='Female', color='tab:orange', alpha=0.8)
+        ax.barh(r2, vals_male, bar_width, label='Male', color='tab:blue', alpha=0.8)
+        ax.barh(r3, vals_full, bar_width, label='All Cohort', color='tab:green', alpha=0.8)
+        
+        ax.set_xlabel('Odds Ratio (OR)')
+        ax.set_yticks([r + bar_width for r in range(len(selected_variables))])
+        ax.set_yticklabels(selected_variables)
+        ax.set_title('Univariate Analysis: Odds Ratios')
+        ax.legend()
+        ax.axvline(x=1, color='gray', linestyle='--', linewidth=0.8)
+        st.pyplot(fig)
+        
+        # Accessibility: Data Table
+        with st.expander("View OR Data as Table"):
+            df_or = pd.DataFrame({
+                "Variable": selected_variables,
+                "OR (Female)": vals_female,
+                "OR (Male)": vals_male,
+                "OR (All)": vals_full
+            })
+            st.dataframe(df_or, use_container_width=True)
+
+# === 4. MULTIVARIATE ANALYSIS ===
+elif page == "4. Multivariate Analysis":
+    st.title("Performance Evaluation by Sex")
+    st.markdown("""
+    Now we will evaluate how well our models perform not just overall, but within each sex. 
+    We use the AUROC (Area Under the Receiver Operating Characteristic Curve) to measure discriminative ability.
+    """)
+
+    with st.spinner("Preparing Data..."):
+        df_raw = build_eicu_data()
+        df_processed = get_processed_data(df_raw)
+        if 'gender' not in df_processed.columns:
+            df_processed['gender'] = df_raw['gender']
+
+    # Filter Logic
+    st.markdown("#### 1. Population Filter (Optional)")
+    enable_filter = st.checkbox("Filter Patient Population?", help="Enable to restrict training to specific demographics.")
+    df_model_input = df_processed.copy()
+    
+    if enable_filter:
+        numeric_options = ['age', 'weight_admission', 'height', 'lab_creatinine']
+        filter_col = st.selectbox("Select Feature:", numeric_options)
+        min_val, max_val = float(df_processed[filter_col].min()), float(df_processed[filter_col].max())
+        range_vals = st.slider(f"Range for {filter_col}:", min_val, max_val, (min_val, max_val))
+        df_model_input = df_processed[(df_processed[filter_col] >= range_vals[0]) & (df_processed[filter_col] <= range_vals[1])]
+
+    # Variable Selection
+    st.markdown("#### 2. Model Features")
+    all_vars = ['age', 'height','weight_admission', 'lab_bun', 'lab_hct', 'lab_hgb', 'lab_mch', 'lab_mchc', 
+                      'lab_mcv', 'lab_rbc', 'lab_rdw', 'lab_albumin', 'lab_bicarbonate', 
+                      'lab_calcium', 'lab_chloride', 'lab_creatinine', 'lab_glucose', 
+                      'lab_platelets', 'lab_potassium', 'lab_sodium', 'lab_wbc']
+    selected_predictors = st.multiselect("Choose predictors:", all_vars, default=all_vars, help="Select variables to include in the multivariate logistic regression.")
+
+    if st.button("Train & Evaluate Models", help="Train 3 separate models (Female, Male, All) and compare their AUROC scores."):
+        if not selected_predictors:
+            st.error("Select at least one predictor.")
+            st.stop()
+            
+        df_male = df_model_input[df_model_input['gender'] == "Male"]
+        df_female = df_model_input[df_model_input['gender'] == "Female"]
+        
+        train_dat_female, test_dat_female = train_test_split(df_female, test_size=0.2, random_state=2025)
+        train_dat_male, test_dat_male = train_test_split(df_male, test_size=0.2, random_state=2025)
+        train_dat, test_dat = train_test_split(df_model_input, test_size=0.2, random_state=2025)
+
+        vals_male, vals_female, vals_full = [], [], []
+
+        try:
+            # Male
+            reg_male = smf.logit(f"in_hospital_mortality ~ " + " + ".join(selected_predictors), data=train_dat_male).fit(disp=0)
+            vals_male.append(roc_auc_score(test_dat_male['in_hospital_mortality'], reg_male.predict(test_dat_male[selected_predictors])))
+            
+            # Female
+            reg_female = smf.logit(f"in_hospital_mortality ~ " + " + ".join(selected_predictors), data=train_dat_female).fit(disp=0)
+            vals_female.append(roc_auc_score(test_dat_female['in_hospital_mortality'], reg_female.predict(test_dat_female[selected_predictors])))
+            
+            # Full
+            reg = smf.logit(f"in_hospital_mortality ~ " + " + ".join(selected_predictors), data=train_dat).fit(disp=0)
+            vals_full.append(roc_auc_score(test_dat['in_hospital_mortality'], reg.predict(test_dat[selected_predictors])))
+            
+            # Plot
+            
+            fig, ax = plt.subplots(figsize=(8, 5))
+            r = np.arange(1)
+            width = 0.25
+            
+            plt.bar(r, vals_female, width, label='Female', color='tab:orange')
+            plt.bar(r + width, vals_male, width, label='Male', color='tab:blue')
+            plt.bar(r + 2*width, vals_full, width, label='All Cohort', color='tab:green')
+            
+            plt.ylabel('AUROC')
+            plt.title('Multivariate Analysis Performance')
+            plt.xticks([])
+            plt.ylim(0.5, 1.0)
+            plt.legend(loc='lower right')
+            
+            # Add labels
+            plt.text(r - 0.05, vals_female[0] + 0.01, f"{vals_female[0]:.3f}")
+            plt.text(r + width - 0.05, vals_male[0] + 0.01, f"{vals_male[0]:.3f}")
+            plt.text(r + 2*width - 0.05, vals_full[0] + 0.01, f"{vals_full[0]:.3f}")
+            
+            st.pyplot(fig)
+            
+            with st.expander("View Results as Table"):
+                res_df = pd.DataFrame({
+                    "Group": ["Female", "Male", "All Cohort"],
+                    "AUROC": [vals_female[0], vals_male[0], vals_full[0]]
+                })
+                st.dataframe(res_df, use_container_width=True)
+
+        except Exception as e:
+            st.error(f"Error training model: {e}")
+
+    # --- QUESTION 2 ---
+    st.divider()
+    st.subheader("Question 2")
+    st.markdown("When comparing the outcomes of these sex-specific models, what are we most interested in identifying?")
+    
+    q2_options = {
+        "A": "The variables with the highest missing values",
+        "B": "The computational time for each model",
+        "C": "Any performance gaps or patterns that differ between sexes",
+        "D": "Whether the models have the same coefficients"
+    }
+    
+    q2_choice = st.radio("Select Answer:", list(q2_options.keys()), format_func=lambda x: f"{x}) {q2_options[x]}", key="q2")
+    
+    if st.button("Submit Question 2"):
+        if q2_choice == "C":
+            st.success("Correct! Our main goal is to see if the model performs differently across the two groups. Are predictions more accurate for one sex than the other? These performance differences can point to underlying biological, clinical, or systemic factors.")
+        else:
+            st.error("Try again.")
